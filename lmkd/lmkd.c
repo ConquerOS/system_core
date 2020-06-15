@@ -84,6 +84,7 @@
 #define ZONEINFO_PATH "/proc/zoneinfo"
 #define MEMINFO_PATH "/proc/meminfo"
 #define PROC_STATUS_TGID_FIELD "Tgid:"
+#define VMSTAT_PATH "/proc/vmstat"
 #define TRACE_MARKER_PATH "/sys/kernel/debug/tracing/trace_marker"
 #define LINE_MAX 128
 #define MAX_NR_ZONES 6
@@ -121,12 +122,14 @@
 #define PSI_WINDOW_SIZE_MS 1000
 /* Polling period after initial PSI signal */
 #define PSI_POLL_PERIOD_MS 10
-/* Poll for the duration of one window after initial PSI signal */
-#define PSI_POLL_COUNT (PSI_WINDOW_SIZE_MS / PSI_POLL_PERIOD_MS)
+/* PSI complete stall for super critical events */
+#define PSI_SCRIT_COMPLETE_STALL_MS (80)
 
 #define min(a, b) (((a) < (b)) ? (a) : (b))
 
 #define FAIL_REPORT_RLIMIT_MS 1000
+
+#define SZ_4G (0x100000000ULL)
 
 #define PSI_PROC_TRAVERSE_DELAY_MS 200
 /* default to old in-kernel interface if no memory pressure events */
@@ -138,13 +141,15 @@ enum vmpressure_level {
     VMPRESS_LEVEL_LOW = 0,
     VMPRESS_LEVEL_MEDIUM,
     VMPRESS_LEVEL_CRITICAL,
+    VMPRESS_LEVEL_SUPER_CRITICAL,
     VMPRESS_LEVEL_COUNT
 };
 
 static const char *level_name[] = {
     "low",
     "medium",
-    "critical"
+    "critical",
+    "super critical",
 };
 
 struct {
@@ -158,7 +163,7 @@ struct psi_threshold {
 };
 
 static int level_oomadj[VMPRESS_LEVEL_COUNT];
-static int mpevfd[VMPRESS_LEVEL_COUNT] = { -1, -1, -1 };
+static int mpevfd[VMPRESS_LEVEL_COUNT] = { -1, -1, -1, -1 };
 static bool debug_process_killing;
 static bool enable_pressure_upgrade;
 static int64_t upgrade_pressure;
@@ -166,6 +171,7 @@ static int64_t downgrade_pressure;
 static bool low_ram_device;
 static bool kill_heaviest_task;
 static unsigned long kill_timeout_ms;
+static int direct_reclaim_pressure = 45;
 static bool use_minfree_levels;
 static bool per_app_memcg;
 static bool enhance_batch_kill;
@@ -176,10 +182,15 @@ static int swap_free_low_percentage;
 static bool use_psi_monitors = false;
 static bool enable_preferred_apps =  false;
 static unsigned long pa_update_timeout_ms = 60000; /* 1 min */
+/* PSI window related variables */
+static int psi_window_size_ms = PSI_WINDOW_SIZE_MS;
+static int psi_poll_period_ms = PSI_POLL_PERIOD_MS;
+static int psi_poll_period_scrit_ms = PSI_POLL_PERIOD_MS;
 static struct psi_threshold psi_thresholds[VMPRESS_LEVEL_COUNT] = {
     { PSI_SOME, 70 },    /* 70ms out of 1sec for partial stall */
     { PSI_SOME, 100 },   /* 100ms out of 1sec for partial stall */
     { PSI_FULL, 70 },    /* 70ms out of 1sec for complete stall */
+    { PSI_FULL, PSI_SCRIT_COMPLETE_STALL_MS }, /* Default 80ms out of 1sec for complete stall */
 };
 
 static android_log_context ctx;
@@ -255,7 +266,8 @@ union zoneinfo {
 
 /* Fields to parse in /proc/meminfo */
 enum meminfo_field {
-    MI_NR_FREE_PAGES = 0,
+    MI_NR_TOTAL_PAGES = 0,
+    MI_NR_FREE_PAGES,
     MI_CACHED,
     MI_SWAP_CACHED,
     MI_BUFFERS,
@@ -278,6 +290,7 @@ enum meminfo_field {
 };
 
 static const char* const meminfo_field_names[MI_FIELD_COUNT] = {
+    "MemTotal:",
     "MemFree:",
     "Cached:",
     "SwapCached:",
@@ -301,6 +314,7 @@ static const char* const meminfo_field_names[MI_FIELD_COUNT] = {
 
 union meminfo {
     struct {
+        int64_t nr_total_pages;
         int64_t nr_free_pages;
         int64_t cached;
         int64_t swap_cached;
@@ -324,6 +338,53 @@ union meminfo {
         int64_t nr_file_pages;
     } field;
     int64_t arr[MI_FIELD_COUNT];
+};
+
+/* Fields to parse in /proc/vmstat */
+enum vmstat_field {
+    VS_FREE_PAGES,
+    VS_INACTIVE_FILE,
+    VS_ACTIVE_FILE,
+    VS_WORKINGSET_REFAULT,
+    VS_PGSCAN_KSWAPD,
+    VS_PGSCAN_DIRECT,
+    VS_PGSCAN_DIRECT_THROTTLE,
+    VS_PGSKIP_DMA,
+    VS_PGSKIP_NORMAL,
+    VS_PGSKIP_HIGH,
+    VS_PGSKIP_MOVABLE,
+    VS_FIELD_COUNT
+};
+
+static const char* const vmstat_field_names[VS_FIELD_COUNT] = {
+    "nr_free_pages",
+    "nr_inactive_file",
+    "nr_active_file",
+    "workingset_refault",
+    "pgscan_kswapd",
+    "pgscan_direct",
+    "pgscan_direct_throttle",
+    "pgskip_dma32",
+    "pgskip_normal",
+    "pgskip_high",
+    "pgskip_movable",
+};
+
+union vmstat {
+    struct {
+        int64_t nr_free_pages;
+        int64_t nr_inactive_file;
+        int64_t nr_active_file;
+        int64_t workingset_refault;
+        int64_t pgscan_kswapd;
+        int64_t pgscan_direct;
+        int64_t pgscan_direct_throttle;
+	int64_t pgskip_dma;
+	int64_t pgskip_normal;
+	int64_t pgskip_high;
+	int64_t pgskip_movable;
+    } field;
+    int64_t arr[VS_FIELD_COUNT];
 };
 
 enum field_match_result {
@@ -398,6 +459,11 @@ static uint8_t killcnt_idx[ADJTOSLOT_COUNT];
 static uint16_t killcnt[MAX_DISTINCT_OOM_ADJ];
 static int killcnt_free_idx = 0;
 static uint32_t killcnt_total = 0;
+
+/* Super critical event related variables. */
+static union vmstat s_crit_base;
+static bool s_crit_event = false;
+static bool s_crit_event_upgraded = false;
 
 /* PAGE_SIZE / 1024 */
 static long page_k;
@@ -1298,6 +1364,60 @@ static int meminfo_parse(union meminfo *mi) {
     return 0;
 }
 
+/* /proc/vmstat parsing routines */
+static bool vmstat_parse_line(char *line, union vmstat *vs)
+{
+    char *cp;
+    char *ap;
+    char *save_ptr;
+    int64_t val;
+    int field_idx;
+    enum field_match_result match_res;
+    cp = strtok_r(line, " ", &save_ptr);
+    if (!cp) {
+        return false;
+    }
+    ap = strtok_r(NULL, " ", &save_ptr);
+    if (!ap) {
+        return false;
+    }
+    match_res = match_field(cp, ap, vmstat_field_names, VS_FIELD_COUNT,
+        &val, &field_idx);
+    if (match_res == PARSE_SUCCESS) {
+        vs->arr[field_idx] = val;
+    }
+    return (match_res != PARSE_FAIL);
+}
+
+static int vmstat_parse(union vmstat *vs)
+{
+    static struct reread_data file_data = {
+        .filename = VMSTAT_PATH,
+        .fd = -1,
+    };
+    char buf[2*PAGE_SIZE];
+    char *save_ptr;
+    char *line;
+    memset(vs, 0, sizeof(union vmstat));
+    /*
+     * Per-zone related info need not present. Prefill them.
+     * If exist, they can be overridden. This change helps
+     * us to check which all zone info we can look into.
+     */
+    vs->field.pgskip_dma = vs->field.pgskip_high = -EINVAL;
+    if (reread_file(&file_data, buf, sizeof(buf)) < 0) {
+        return -1;
+    }
+    for (line = strtok_r(buf, "\n", &save_ptr); line;
+         line = strtok_r(NULL, "\n", &save_ptr)) {
+        if (!vmstat_parse_line(line, vs)) {
+            ALOGE("%s parse error", file_data.filename);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static void meminfo_log(union meminfo *mi) {
     for (int field_idx = 0; field_idx < MI_FIELD_COUNT; field_idx++) {
         android_log_write_int32(ctx, (int32_t)min(mi->arr[field_idx] * page_k, INT32_MAX));
@@ -1396,6 +1516,14 @@ static void trace_log(char *fmt, ...)
     static int fd = -1;
     ssize_t len, ret;
 
+    if (fd == -ENOENT)
+	    return;
+
+    if ((fd < 0) && access(TRACE_MARKER_PATH, F_OK)) {
+	    fd = -ENOENT;
+	    return;
+    }
+
     if (fd < 0) {
 	    fd = open(TRACE_MARKER_PATH, O_WRONLY | O_CLOEXEC);
 	    if (fd < 0) {
@@ -1412,9 +1540,11 @@ static void trace_log(char *fmt, ...)
     len = strlen(buf);
     ret = TEMP_FAILURE_RETRY(write(fd, buf, len));
     if (ret < 0) {
-	    ALOGE("Error writing " TRACE_MARKER_PATH ";errno=%d", errno);
-	    close(fd);
-	    fd = -1;
+	    if (errno != EBADF) {
+		    ALOGE("Error writing " TRACE_MARKER_PATH ";errno=%d", errno);
+		    close(fd);
+		    fd = -1;
+	    }
 	    return;
     } else if (ret < len) {
 	    ALOGE("Short write on " TRACE_MARKER_PATH "; length=%zd", ret);
@@ -1428,11 +1558,23 @@ static void trace_log(char *fmt, ...)
 #else
 #define ULMK_LOG(X, fmt...) ALOG##X(fmt)
 #endif
-static int file_cache_to_adj(int nr_file)
+static int file_cache_to_adj(enum vmpressure_level __unused lvl, int nr_free,
+			     int nr_file)
 {
     int min_score_adj = OOM_SCORE_ADJ_MAX + 1;
     int minfree;
     int i;
+    int crit_minfree;
+    int s_crit_adj_level = level_oomadj[VMPRESS_LEVEL_SUPER_CRITICAL];
+
+    /*
+     * Below condition is to catch the zones where the file pages
+     * are not allowed to, eg: Movable zone.
+     * A corner case is where file_cache = 0 in the allowed zones
+     * which is a very rare scenario.
+     */
+    if (!nr_file)
+	    goto out;
 
     for (i = 0; i < lowmem_targets_size; i++) {
         minfree = lowmem_minfree[i];
@@ -1441,14 +1583,38 @@ static int file_cache_to_adj(int nr_file)
             break;
         }
     }
-    ULMK_LOG(E, "adj: %d file_cache: %d\n", min_score_adj, nr_file);
+
+    crit_minfree = lowmem_minfree[lowmem_targets_size - 1] +
+		(lowmem_minfree[lowmem_targets_size - 1] -
+		 lowmem_minfree[lowmem_targets_size - 2]);
+    /* Adjust the selected adj in accordance with pressure. */
+    if (s_crit_event && !s_crit_event_upgraded && (min_score_adj > s_crit_adj_level)) {
+	    min_score_adj = s_crit_adj_level;
+    } else {
+	    if (s_crit_event_upgraded &&
+		nr_free < lowmem_minfree[lowmem_targets_size -1] &&
+		nr_file < crit_minfree &&
+		min_score_adj > s_crit_adj_level) {
+		    min_score_adj = s_crit_adj_level;
+	    }
+    }
+
+out:
+    /*
+     * If event is upgraded, just allow one kill in that window. This
+     * is to avoid the aggressiveness of kills by upgrading the event.
+     */
+    if (s_crit_event_upgraded)
+	    s_crit_event_upgraded = s_crit_event = false;
+    if (debug_process_killing)
+	    ULMK_LOG(E, "adj:%d file_cache: %d\n", min_score_adj, nr_file);
     return min_score_adj;
 }
 
 /*
  * Returns OOM_XCORE_ADJ_MAX + 1  on parsing error.
  */
-static int zone_watermarks_ok()
+static int zone_watermarks_ok(enum vmpressure_level level)
 {
     static struct reread_data file_data = {
         .filename = ZONEINFO_PATH,
@@ -1456,8 +1622,9 @@ static int zone_watermarks_ok()
     };
     char buf[2 * PAGE_SIZE];
     char *offset;
-    struct watermark_info w;
-    int zone_id, i, nr;
+    struct watermark_info w[MAX_NR_ZONES];
+    static union vmstat vs1, vs2;
+    int zone_id, i, nr, present_zones = 0;
     bool lowmem_reserve_ok[MAX_NR_ZONES];
     int nr_file = 0;
     int min_score_adj = OOM_SCORE_ADJ_MAX + 1;
@@ -1469,36 +1636,64 @@ static int zone_watermarks_ok()
     memset(&w, 0, sizeof(w));
     memset(&lowmem_reserve_ok, 0, sizeof(lowmem_reserve_ok));
     offset = buf;
-    for (zone_id = 0; zone_id < MAX_NR_ZONES; zone_id++) {
-        int margin;
 
-        nr = parse_one_zone_watermark(offset, &w);
-        if (!nr)
-            break;
+    /* Parse complete zone info. */
+    for (zone_id = 0; zone_id < MAX_NR_ZONES; zone_id++, present_zones++) {
+	    nr = parse_one_zone_watermark(offset, &w[zone_id]);
+	    if (!nr)
+		    break;
+	    offset += nr;
+    }
+    if (!present_zones)
+	    goto out;
 
-        offset += nr;
-        ULMK_LOG(D, "Zone %s: free:%d high:%d cma:%d reserve:(%d %d %d) anon:(%d %d) file:(%d %d)\n",
-                w.name, w.free, w.high, w.cma,
-                w.lowmem_reserve[0], w.lowmem_reserve[1], w.lowmem_reserve[2],
-                w.inactive_anon, w.active_anon, w.inactive_file, w.active_file);
-
-        /* Zone is empty */
-        if (!w.present)
-            continue;
-
-        nr_file += w.inactive_file + w.active_file;
-
-        margin = w.free - w.cma - w.high;
-        for (i = 0; i < MAX_NR_ZONES; i++)
-            if (w.lowmem_reserve[i] && (margin > w.lowmem_reserve[i]))
-                lowmem_reserve_ok[i] = true;
-
-        if (margin >= 0 || lowmem_reserve_ok[zone_id])
-            continue;
-
-        return file_cache_to_adj(nr_file);
+    if (vmstat_parse(&vs1) < 0) {
+	    ULMK_LOG(E, "Failed to parse vmstat!");
+	    goto out;
     }
 
+    for (zone_id = 0, i = VS_PGSKIP_DMA;
+		 i <= VS_PGSKIP_MOVABLE && zone_id < present_zones; ++i) {
+	    if (vs1.arr[i] == -EINVAL)
+		    continue;
+	    /*
+	     * If no page is skipped while reclaiming, then consider this
+	     * zone file cache stats.
+	     */
+	    if (!(vs1.arr[i] - vs2.arr[i]))
+		    nr_file += w[zone_id].inactive_file + w[zone_id].active_file;
+
+	    ++zone_id;
+    }
+
+    vs2 = vs1;
+    for (zone_id = 0; zone_id < present_zones; zone_id++) {
+        int margin;
+
+	if (debug_process_killing)
+	        ULMK_LOG(D, "Zone %s: free:%d high:%d cma:%d reserve:(%d %d %d) anon:(%d %d) file:(%d %d)\n",
+		        w[zone_id].name, w[zone_id].free, w[zone_id].high, w[zone_id].cma,
+			w[zone_id].lowmem_reserve[0], w[zone_id].lowmem_reserve[1],
+			w[zone_id].lowmem_reserve[2],
+		        w[zone_id].inactive_anon, w[zone_id].active_anon,
+			w[zone_id].inactive_file, w[zone_id].active_file);
+
+        /* Zone is empty */
+        if (!w[zone_id].present)
+            continue;
+
+        margin = w[zone_id].free - w[zone_id].cma - w[zone_id].high;
+        for (i = 0; i < present_zones; i++)
+            if (w[zone_id].lowmem_reserve[i] && (margin > w[zone_id].lowmem_reserve[i]))
+                lowmem_reserve_ok[i] = true;
+
+        if (!s_crit_event && (margin >= 0 || lowmem_reserve_ok[zone_id]))
+            continue;
+
+        return file_cache_to_adj(level, w[zone_id].free, nr_file);
+    }
+
+out:
     if (offset == buf)
         ALOGE("Parsing watermarks failed in %s", file_data.filename);
 
@@ -1864,7 +2059,6 @@ static int kill_one_process(struct proc* procp, int min_oom_score) {
     inc_killcnt(procp->oomadj);
     ULMK_LOG(E, "Kill '%s' (%d), uid %d, oom_adj %d to free %ldkB", taskname, pid, uid, procp->oomadj,
           tasksize * page_k);
-
     TRACE_KILL_END();
 
     last_killed_pid = pid;
@@ -1958,6 +2152,10 @@ static int64_t get_memory_usage(struct reread_data *file_data) {
     int64_t mem_usage;
     char buf[32];
 
+    if (access(file_data->filename, F_OK)) {
+        return -1;
+    }
+
     if (reread_file(file_data, buf, sizeof(buf)) < 0) {
         return -1;
     }
@@ -2027,6 +2225,52 @@ static bool is_kill_pending(void) {
     return false;
 }
 
+enum vmpressure_level upgrade_vmpressure_event(enum vmpressure_level level)
+{
+	static union vmstat base;
+	union vmstat current;
+	int64_t throttle, pressure;
+	static int64_t sync, async;
+
+	switch (level) {
+		case VMPRESS_LEVEL_LOW:
+		    if (vmstat_parse(&base) < 0) {
+			    ULMK_LOG(E, "Failed to parse vmstat!");
+			    goto out;
+		    }
+		    break;
+		case VMPRESS_LEVEL_MEDIUM:
+		case VMPRESS_LEVEL_CRITICAL:
+		   if (vmstat_parse(&current) < 0) {
+			   ULMK_LOG(E, "Failed to parse vmstat!");
+			    goto out;
+		   }
+		   throttle = current.field.pgscan_direct_throttle -
+			      base.field.pgscan_direct_throttle;
+		   sync += (current.field.pgscan_direct -
+			    base.field.pgscan_direct);
+		   async += (current.field.pgscan_kswapd -
+			     base.field.pgscan_kswapd);
+		   /*
+		    * Here scan window size is put at 4MB(=1024 pages).
+		    */
+		   if (throttle || (sync + async) >= 1024) {
+			   pressure = ((100 * sync)/(sync + async + 1));
+			   if (throttle || (pressure >= direct_reclaim_pressure)) {
+				   s_crit_event = s_crit_event_upgraded = true;
+				   s_crit_base = current;
+			   }
+			   sync = async = 0;
+		   }
+		   base = current;
+		   break;
+	    default:
+		   ;
+    }
+out:
+	return level;
+}
+
 static void mp_event_common(int data, uint32_t events __unused) {
     int ret;
     unsigned long long evcount;
@@ -2051,6 +2295,9 @@ static void mp_event_common(int data, uint32_t events __unused) {
         .filename = MEMCG_MEMORYSW_USAGE,
         .fd = -1,
     };
+
+    if (!s_crit_event)
+	    level = upgrade_vmpressure_event(level);
 
     if (debug_process_killing) {
         ALOGI("%s memory pressure event is triggered", level_name[level]);
@@ -2193,7 +2440,7 @@ static void mp_event_common(int data, uint32_t events __unused) {
     }
 
 do_kill:
-    if (low_ram_device) {
+    if (low_ram_device && per_app_memcg) {
         /* For Go devices kill only one task */
         if (find_and_kill_process(level_oomadj[level]) == 0) {
             if (debug_process_killing) {
@@ -2219,11 +2466,11 @@ do_kill:
                     return;
                 }
                 min_score_adj = level_oomadj[level];
-            } else {
-                min_score_adj = zone_watermarks_ok();
-                if (min_score_adj == OOM_SCORE_ADJ_MAX + 1)
-		        {
-                    ULMK_LOG(I, "Ignoring pressure since per-zone watermarks ok");
+	    } else {
+                min_score_adj = zone_watermarks_ok(level);
+                if (min_score_adj == OOM_SCORE_ADJ_MAX + 1) {
+			if (debug_process_killing)
+	                    ULMK_LOG(I, "Ignoring pressure since per-zone watermarks ok");
                     return;
                 }
             }
@@ -2269,7 +2516,7 @@ do_kill:
 static bool init_mp_psi(enum vmpressure_level level) {
     int fd = init_psi_monitor(psi_thresholds[level].stall_type,
         psi_thresholds[level].threshold_ms * US_PER_MS,
-        PSI_WINDOW_SIZE_MS * US_PER_MS);
+        psi_window_size_ms * US_PER_MS);
 
     if (fd < 0) {
         return false;
@@ -2307,6 +2554,12 @@ static bool init_psi_monitors() {
         return false;
     }
     if (!init_mp_psi(VMPRESS_LEVEL_CRITICAL)) {
+        destroy_mp_psi(VMPRESS_LEVEL_MEDIUM);
+        destroy_mp_psi(VMPRESS_LEVEL_LOW);
+        return false;
+    }
+    if (!init_mp_psi(VMPRESS_LEVEL_SUPER_CRITICAL)) {
+        destroy_mp_psi(VMPRESS_LEVEL_CRITICAL);
         destroy_mp_psi(VMPRESS_LEVEL_MEDIUM);
         destroy_mp_psi(VMPRESS_LEVEL_LOW);
         return false;
@@ -2383,6 +2636,7 @@ err_open_mpfd:
 
 static int init(void) {
     struct epoll_event epev;
+    union meminfo info;
     int i;
     int ret;
 
@@ -2390,6 +2644,30 @@ static int init(void) {
     if (page_k == -1)
         page_k = PAGE_SIZE;
     page_k /= 1024;
+
+    /*
+     * Set the optimal settings for lowram targets.
+     */
+    if (!meminfo_parse(&info)) {
+	if (info.field.nr_total_pages < (SZ_4G / PAGE_SIZE)) {
+		    if (psi_window_size_ms > 500) {
+			    psi_window_size_ms = 500;
+			    ULMK_LOG(I, "PSI window size is changed to %dms\n", psi_window_size_ms);
+		    }
+		    if (psi_poll_period_scrit_ms < 100) {
+			    psi_poll_period_scrit_ms = 100;
+			    ULMK_LOG(I, "PSI poll period for super critical event is changed to %dms\n", psi_poll_period_scrit_ms);
+		    }
+	}
+    } else
+	    ULMK_LOG(E, "Failed to parse the meminfo\n");
+
+    /*
+     * Ensure min polling period for supercritical event is no less than
+     * the default polling period.
+     */
+    if (psi_poll_period_scrit_ms < psi_poll_period_ms)
+	    psi_poll_period_scrit_ms = psi_poll_period_ms;
 
     epollfd = epoll_create(MAX_EPOLL_EVENTS);
     if (epollfd == -1) {
@@ -2457,37 +2735,71 @@ static int init(void) {
     return 0;
 }
 
+static bool have_psi_events(struct epoll_event *evt, int nevents)
+{
+	int i;
+	struct event_handler_info* handler_info;
+
+	for (i = 0; i < nevents; i++, evt++) {
+		if (evt->events & (EPOLLERR | EPOLLHUP))
+			continue;
+		if (evt->data.ptr) {
+			handler_info = (struct event_handler_info*)evt->data.ptr;
+			if (handler_info->handler == mp_event_common)
+				return true;
+		}
+	}
+
+	return false;
+}
+
 static void mainloop(void) {
     struct event_handler_info* handler_info;
     struct event_handler_info* poll_handler = NULL;
     struct timespec last_report_tm, curr_tm;
     struct epoll_event *evt;
+    union vmstat s_crit_current;
     long delay = -1;
+    int psi_poll_count = psi_window_size_ms / psi_poll_period_ms;
+    union vmstat poll1 = {{0}}, poll2 = {{0}};
     int polling = 0;
 
     while (1) {
         struct epoll_event events[maxevents];
         int nevents;
+	int poll_period;
         int i;
+	bool skip_handler = false, s_crit_tmp = false;
 
         if (polling) {
             /* Calculate next timeout */
             clock_gettime(CLOCK_MONOTONIC_COARSE, &curr_tm);
+	    poll_period = !s_crit_event ? psi_poll_period_ms : psi_poll_period_scrit_ms;
             delay = get_time_diff_ms(&last_report_tm, &curr_tm);
-            delay = (delay < PSI_POLL_PERIOD_MS) ?
-                PSI_POLL_PERIOD_MS - delay : PSI_POLL_PERIOD_MS;
+            delay = (delay < poll_period) ? poll_period - delay : poll_period;
 
             /* Wait for events until the next polling timeout */
             nevents = epoll_wait(epollfd, events, maxevents, delay);
 
             clock_gettime(CLOCK_MONOTONIC_COARSE, &curr_tm);
-            if (get_time_diff_ms(&last_report_tm, &curr_tm) >= PSI_POLL_PERIOD_MS) {
+            if (get_time_diff_ms(&last_report_tm, &curr_tm) >= poll_period) {
                 polling--;
-                poll_handler->handler(poll_handler->data, 0);
+		if (s_crit_event) {
+			vmstat_parse(&poll2);
+			if ((nevents > 0 && have_psi_events(events, nevents)) ||
+			    (!(poll2.field.pgscan_direct - poll1.field.pgscan_direct) &&
+			    !(poll2.field.pgscan_kswapd - poll1.field.pgscan_kswapd) &&
+			    !(poll2.field.pgscan_direct_throttle - poll1.field.pgscan_direct_throttle)))
+				skip_handler = true;
+			poll1 = poll2;
+		}
+		if (!skip_handler)
+	               poll_handler->handler(poll_handler->data, 0);
                 clock_gettime(CLOCK_MONOTONIC_COARSE, &last_report_tm);
             }
         } else {
             /* Wait for events with no timeout */
+	    s_crit_event = false;
             nevents = epoll_wait(epollfd, events, maxevents, -1);
         }
 
@@ -2523,18 +2835,69 @@ static void mainloop(void) {
             }
             if (evt->data.ptr) {
                 handler_info = (struct event_handler_info*)evt->data.ptr;
+		/*
+		 * Handle the below cases:
+		 * 1) When a super critical event is generated, the handler
+		 *    don't process it as the s_crit_event is not set thus
+		 *    we can miss a kill.
+		 *
+		 * 2) When a medium/critical event is generated while handling
+		 *    supercritical event and If that generated event can make
+		 *    the s_crit_event = false, still there will be an extra
+		 *    kill.
+		 */
+		if (handler_info->handler == mp_event_common) {
+			if (handler_info->data == VMPRESS_LEVEL_SUPER_CRITICAL)
+				s_crit_event = true;
+			else if(s_crit_event) {
+				s_crit_tmp = s_crit_event;
+				s_crit_event = false;
+			}
+		}
                 handler_info->handler(handler_info->data, evt->events);
+		if (s_crit_tmp) {
+			s_crit_event = s_crit_tmp;
+			s_crit_tmp = false;
+		}
 
                 if (use_psi_monitors && handler_info->handler == mp_event_common) {
-                    if (polling && handler_info->data < poll_handler->data)
+		    if (handler_info->data == VMPRESS_LEVEL_SUPER_CRITICAL) {
+			    /* Scale the 'polling' accordingly */
+			    if (psi_poll_period_scrit_ms != psi_poll_period_ms)
+				    polling /= (psi_poll_period_scrit_ms / psi_poll_period_ms);
+			    vmstat_parse(&s_crit_base);
+			    continue;
+		    }
+                    if (polling && (handler_info->data < poll_handler->data || s_crit_event)) {
+			/*
+			 * Override the supercritical event only if the system
+			 * is not in direct reclaim.
+			 */
+			if (s_crit_event) {
+				int64_t throttle, sync;
+
+				vmstat_parse(&s_crit_current);
+				throttle = s_crit_current.field.pgscan_direct_throttle -
+					   s_crit_base.field.pgscan_direct_throttle;
+				sync = s_crit_current.field.pgscan_direct -
+				       s_crit_base.field.pgscan_direct;
+				if (!throttle && !sync) {
+					s_crit_event = false;
+					/* Reset the scaled polling period. */
+					if (psi_poll_period_scrit_ms != psi_poll_period_ms)
+						polling *= (psi_poll_period_scrit_ms / psi_poll_period_ms);
+				}
+				s_crit_base = s_crit_current;
+			}
                         continue;
+		    }
 
                     /*
-                     * Poll for the duration of PSI_WINDOW_SIZE_MS after the
+                     * Poll for the duration of psi_window_size_ms after the
                      * initial PSI event because psi events are rate-limited
                      * at one per sec.
                      */
-                    polling = PSI_POLL_COUNT;
+                    polling = psi_poll_count;
                     poll_handler = handler_info;
                     clock_gettime(CLOCK_MONOTONIC_COARSE, &last_report_tm);
                 }
@@ -2555,6 +2918,8 @@ int main(int argc __unused, char **argv __unused) {
         property_get_int32("ro.lmk.medium", 800);
     level_oomadj[VMPRESS_LEVEL_CRITICAL] =
         property_get_int32("ro.lmk.critical", 0);
+    /* This will gets updated through perf_wait_get_prop. */
+    level_oomadj[VMPRESS_LEVEL_SUPER_CRITICAL] = 606;
     debug_process_killing = property_get_bool("ro.lmk.debug", false);
 
     /* By default disable upgrade/downgrade logic */
@@ -2605,6 +2970,31 @@ int main(int argc __unused, char **argv __unused) {
           snprintf(default_value, PROPERTY_VALUE_MAX, "%lu", (kill_timeout_ms));
           strlcpy(property, perf_wait_get_prop("ro.lmk.kill_timeout_ms_dup", default_value).value, PROPERTY_VALUE_MAX);
           kill_timeout_ms =  strtod(property, NULL);
+
+	  snprintf(default_value, PROPERTY_VALUE_MAX, "%d",
+			  level_oomadj[VMPRESS_LEVEL_SUPER_CRITICAL]);
+	  strlcpy(property, perf_wait_get_prop("ro.lmk.super_critical", default_value).value, PROPERTY_VALUE_MAX);
+	  level_oomadj[VMPRESS_LEVEL_SUPER_CRITICAL] = strtod(property, NULL);
+
+	  snprintf(default_value, PROPERTY_VALUE_MAX, "%d", PSI_WINDOW_SIZE_MS);
+	  strlcpy(property, perf_wait_get_prop("ro.lmk.psi_window_size_ms", default_value).value, PROPERTY_VALUE_MAX);
+	  psi_window_size_ms = strtod(property, NULL);
+
+	  snprintf(default_value, PROPERTY_VALUE_MAX, "%d", PSI_POLL_PERIOD_MS);
+	  strlcpy(property, perf_wait_get_prop("ro.lmk.psi_poll_period_ms", default_value).value, PROPERTY_VALUE_MAX);
+	  psi_poll_period_ms = strtod(property, NULL);
+
+	  snprintf(default_value, PROPERTY_VALUE_MAX, "%d", PSI_POLL_PERIOD_MS);
+	  strlcpy(property, perf_wait_get_prop("ro.lmk.psi_poll_period_scrit_ms", default_value).value, PROPERTY_VALUE_MAX);
+	  psi_poll_period_scrit_ms = strtod(property, NULL);
+
+	  snprintf(default_value, PROPERTY_VALUE_MAX, "%d", PSI_SCRIT_COMPLETE_STALL_MS);
+	  strlcpy(property, perf_wait_get_prop("ro.lmk.psi_scrit_complete_stall_ms", default_value).value, PROPERTY_VALUE_MAX);
+	  psi_thresholds[VMPRESS_LEVEL_SUPER_CRITICAL].threshold_ms = strtod(property, NULL);
+
+	  snprintf(default_value, PROPERTY_VALUE_MAX, "%d", direct_reclaim_pressure);
+	  strlcpy(property, perf_wait_get_prop("ro.lmk.direct_reclaim_pressure", default_value).value, PROPERTY_VALUE_MAX);
+	  direct_reclaim_pressure = strtod(property, NULL);
 
           strlcpy(default_value, (use_minfree_levels)? "true" : "false", PROPERTY_VALUE_MAX);
           strlcpy(property, perf_wait_get_prop("ro.lmk.use_minfree_levels_dup", default_value).value, PROPERTY_VALUE_MAX);

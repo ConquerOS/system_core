@@ -1312,7 +1312,7 @@ static bool IsMountPointMounted(const std::string& mount_point) {
 // When multiple fstab records share the same mount_point, it will try to mount each
 // one in turn, and ignore any duplicates after a first successful mount.
 // Returns -1 on error, and  FS_MGR_MNTALL_* otherwise.
-int fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
+MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
     int encryptable = FS_MGR_MNTALL_DEV_NOT_ENCRYPTABLE;
     int error_count = 0;
     CheckpointManager checkpoint_manager;
@@ -1320,8 +1320,9 @@ int fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
     bool is_ffbm = false;
     AvbUniquePtr avb_handle(nullptr);
 
+    bool userdata_mounted = false;
     if (fstab->empty()) {
-        return FS_MGR_MNTALL_FAIL;
+        return {FS_MGR_MNTALL_FAIL, userdata_mounted};
     }
     /**get boot mode*/
     property_get("ro.bootmode", propbuf, "");
@@ -1369,7 +1370,7 @@ int fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
         }
 
         // Terrible hack to make it possible to remount /data.
-        // TODO: refact fs_mgr_mount_all and get rid of this.
+        // TODO: refactor fs_mgr_mount_all and get rid of this.
         if (mount_mode == MOUNT_MODE_ONLY_USERDATA && current_entry.mount_point != "/data") {
             continue;
         }
@@ -1405,7 +1406,7 @@ int fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
                 avb_handle = AvbHandle::Open();
                 if (!avb_handle) {
                     LERROR << "Failed to open AvbHandle";
-                    return FS_MGR_MNTALL_FAIL;
+                    return {FS_MGR_MNTALL_FAIL, userdata_mounted};
                 }
             }
             if (avb_handle->SetUpAvbHashtree(&current_entry, true /* wait_for_verity_dev */) ==
@@ -1447,7 +1448,7 @@ int fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
 
             if (status == FS_MGR_MNTALL_FAIL) {
                 // Fatal error - no point continuing.
-                return status;
+                return {status, userdata_mounted};
             }
 
             if (status != FS_MGR_MNTALL_DEV_NOT_ENCRYPTABLE) {
@@ -1461,11 +1462,14 @@ int fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
                                    attempted_entry.mount_point},
                                   nullptr)) {
                         LERROR << "Encryption failed";
-                        return FS_MGR_MNTALL_FAIL;
+                        return {FS_MGR_MNTALL_FAIL, userdata_mounted};
                     }
                 }
             }
 
+            if (current_entry.mount_point == "/data") {
+                userdata_mounted = true;
+            }
             // Success!  Go get the next one.
             continue;
         }
@@ -1569,9 +1573,9 @@ int fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
 #endif
 
     if (error_count) {
-        return FS_MGR_MNTALL_FAIL;
+        return {FS_MGR_MNTALL_FAIL, userdata_mounted};
     } else {
-        return encryptable;
+        return {encryptable, userdata_mounted};
     }
 }
 
@@ -1793,8 +1797,8 @@ int fs_mgr_remount_userdata_into_checkpointing(Fstab* fstab) {
         }
         LINFO << "Remounting /data";
         // TODO(b/143970043): remove this hack after fs_mgr_mount_all is refactored.
-        int result = fs_mgr_mount_all(fstab, MOUNT_MODE_ONLY_USERDATA);
-        return result == FS_MGR_MNTALL_FAIL ? -1 : 0;
+        auto result = fs_mgr_mount_all(fstab, MOUNT_MODE_ONLY_USERDATA);
+        return result.code == FS_MGR_MNTALL_FAIL ? -1 : 0;
     }
     return 0;
 }
